@@ -69,21 +69,92 @@ npm run dev
 
 ## Docker
 
-### 本地构建与运行
+### 直接部署（GHCR 镜像）
+
+项目已通过 GitHub Actions 自动构建并推送镜像到 GHCR：
+
+```bash
+docker pull ghcr.io/lovely71/cursor2api:latest
+```
+
+运行（推荐挂载配置文件）：
+
+```bash
+docker run -d --name cursor2api \
+  --restart unless-stopped \
+  -p 3010:3010 \
+  -v ./config.yaml:/app/config.yaml:ro \
+  -e NODE_ENV=production \
+  ghcr.io/lovely71/cursor2api:latest
+```
+
+启动后访问：
+
+- 信息面板：`http://localhost:3010/ui`
+- 实时日志：`http://localhost:3010/logs`
+
+> 如果镜像仓库是私有的，需要先登录：`docker login ghcr.io`（使用 GitHub PAT，需具备 Packages 读取权限）。
+
+### docker compose 部署（推荐）
+
+参考配置（将其保存为 `docker-compose.yml`，或按需合并到现有 compose 文件）：
+
+```yaml
+services:
+  cursor2api:
+    image: ghcr.io/lovely71/cursor2api:latest
+    container_name: cursor2api
+    restart: unless-stopped
+    ports:
+      - "3010:3010"
+    volumes:
+      # 配置文件持久化（推荐）
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - NODE_ENV=production
+      # 可选：用环境变量覆盖 config.yaml
+      # - PORT=3010
+      # - TIMEOUT=120
+      # - CURSOR_MODEL=anthropic/claude-sonnet-4.6
+      # - PROXY=http://user:pass@127.0.0.1:7890
+```
+
+启动：
+
+```bash
+docker compose up -d
+```
+
+### 存储路径（需要挂载什么？）
+
+本项目整体是**无状态**的：不需要数据库或磁盘存储。
+
+- **必须/推荐**：`/app/config.yaml`（挂载你的配置文件，便于修改配置后 `docker restart` 生效）
+- **可选**：如果只想通过环境变量配置，也可以不挂载 `config.yaml`
+
+### 环境变量说明
+
+这些变量会覆盖 `config.yaml` 中对应项：
+
+- `PORT`：监听端口（默认 `3010`）
+- `TIMEOUT`：空闲超时秒数（默认 `120`）
+- `CURSOR_MODEL`：Cursor 使用的模型名（如 `anthropic/claude-sonnet-4.6`）
+- `PROXY`：HTTP/HTTPS 代理（让 Node.js fetch 走代理；国内机房常用）
+- `FP`：base64 编码的浏览器指纹 JSON（目前主要支持 `userAgent`）
+
+### 部署建议（安全）
+
+由于本服务默认开放 CORS 且可被当作公开代理使用，**不建议直接暴露到公网**。建议：
+
+- 仅在内网使用，或配合反向代理做鉴权（Basic Auth / IP 白名单 / Zero Trust）
+- 配置防火墙或安全组，仅允许自己的客户端访问
+- 如需公网部署，至少加访问控制和限流
+
+### 本地构建与运行（开发/自定义）
 
 ```bash
 docker compose up -d --build
 ```
-
-### GitHub Actions 自动构建（GHCR）
-
-仓库已内置 GitHub Actions：每次 push 到 `main/master`、或打 tag（如 `v2.5.1`）会自动构建并发布镜像到 GHCR：
-
-```bash
-docker pull ghcr.io/<owner>/<repo>:latest
-```
-
-> 镜像发布依赖 GitHub 自带的 `GITHUB_TOKEN`，无需额外配置；只需确保仓库开启 Packages 写入权限。
 
 ### 4. 配合 Claude Code 使用
 
