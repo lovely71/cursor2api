@@ -60,6 +60,31 @@ npm install
 npm run dev
 ```
 
+启动后可打开浏览器查看 UI：
+
+- 信息面板：`http://localhost:3010/ui`
+- 实时日志：`http://localhost:3010/logs`
+
+> 说明：浏览器访问根路径 `/` 默认会返回 HTML；脚本/CLI（如 curl）访问 `/` 默认仍返回 JSON。
+
+## Docker
+
+### 本地构建与运行
+
+```bash
+docker compose up -d --build
+```
+
+### GitHub Actions 自动构建（GHCR）
+
+仓库已内置 GitHub Actions：每次 push 到 `main/master`、或打 tag（如 `v2.5.1`）会自动构建并发布镜像到 GHCR：
+
+```bash
+docker pull ghcr.io/<owner>/<repo>:latest
+```
+
+> 镜像发布依赖 GitHub 自带的 `GITHUB_TOKEN`，无需额外配置；只需确保仓库开启 Packages 写入权限。
+
 ### 4. 配合 Claude Code 使用
 
 ```bash
