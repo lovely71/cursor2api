@@ -53,10 +53,13 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # 常见平台：
+          # - linux/amd64: x86_64 服务器/PC
+          # - linux/arm64: Apple Silicon、ARM 云服务器
+          # - linux/arm/v7: 树莓派等 32-bit ARM
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-

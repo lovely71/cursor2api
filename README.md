@@ -77,6 +77,9 @@ npm run dev
 docker pull ghcr.io/lovely71/cursor2api:latest
 ```
 
+> 说明：GHCR 页面里看到的 `unknown/unknown` 通常是 **OCI Image Index / Manifest List**（多架构镜像清单），不是实际可运行的 CPU 架构。
+> 真正可运行的架构会显示为 `linux/amd64`、`linux/arm64`、`linux/arm/v7` 等。
+
 运行（推荐挂载配置文件）：
 
 ```bash
