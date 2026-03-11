@@ -48,7 +48,23 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build (and push)
+      - name: Build (PR)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          # 提高兼容性：关闭 provenance/SBOM（避免生成 unknown/unknown 的 attestation-manifest）
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push (multi-arch)
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -58,7 +74,12 @@ jobs:
           # - linux/arm64: Apple Silicon、ARM 云服务器
           # - linux/arm/v7: 树莓派等 32-bit ARM
           platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: ${{ github.event_name != 'pull_request' }}
+          # 兼容性：
+          # - provenance/sbom=false：避免产生 "unknown/unknown" 的 attestation-manifest
+          # - oci-mediatypes=false：输出 Docker V2 Schema2 manifest list（部分平台不支持 OCI index）
+          provenance: false
+          sbom: false
+          outputs: type=image,push=true,oci-mediatypes=false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
