@@ -125,6 +125,64 @@ services:
 docker compose up -d
 ```
 
+### ClawCloud Run（claw.cloud）部署指南
+
+> 适合不想自己运维服务器的场景：直接使用 GHCR 镜像部署。
+
+1) 创建应用
+
+- 打开 ClawCloud Run 控制台：`https://console.run.claw.cloud`
+- 进入 **App Launchpad** → **Create APP**
+- Application Type 选择 **Docker Image**
+
+2) 镜像与端口
+
+- Image Type：`Public`
+- Image Name：`ghcr.io/lovely71/cursor2api:latest`
+- Network / Container Port：`3010`（HTTP）
+
+3) 环境变量（可选）
+
+在 **Environment Variables** 中按行粘贴（每行一个）：
+
+```bash
+NODE_ENV=production
+PORT=3010
+TIMEOUT=120
+
+# 可选：模型名/代理
+# CURSOR_MODEL=anthropic/claude-sonnet-4.6
+# PROXY=http://user:pass@127.0.0.1:7890
+```
+
+4) 配置文件（推荐）
+
+在 **Configuration Files** 中新增一个文件（用于替代 Docker 的 volume 挂载）：
+
+- Container Path：`/app/config.yaml`
+- Content：复制本仓库的 `config.yaml` 内容并按需修改
+
+5) 健康检查与访问
+
+- 如平台需要配置 Health Check，建议使用：`GET /health`（避免出现 `no healthy upstream`）
+- 部署完成后，打开平台分配的域名：
+  - `/ui`：信息面板
+  - `/logs`：实时日志
+
+6) 持久化存储（一般不需要）
+
+本服务本身是无状态的，通常不需要挂载 **Persistent Storage**。
+
+- 不建议把存储卷挂载到 `/app`（会覆盖镜像内程序文件导致无法启动）
+- 如确需持久化目录，建议挂载到 `/data` 并在你自己的业务逻辑中使用
+
+参考文档：
+
+- [App Launchpad](https://docs.run.claw.cloud/clawcloud-run/guide/app-launchpad)
+- [Environment Variables](https://docs.run.claw.cloud/clawcloud-run/guide/app-launchpad/environment-variables)
+- [Configuration Files](https://docs.run.claw.cloud/clawcloud-run/guide/app-launchpad/configuration-files)
+- [Persistent Storage](https://docs.run.claw.cloud/clawcloud-run/guide/app-launchpad/persistent-storage)
+
 ### 存储路径（需要挂载什么？）
 
 本项目整体是**无状态**的：不需要数据库或磁盘存储。
