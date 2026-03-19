@@ -8,19 +8,11 @@
 import 'dotenv/config';
 import { createRequire } from 'module';
 import express from 'express';
-import { getConfig } from './config.js';
+import { getConfig, initConfigWatcher, stopConfigWatcher } from './config.js';
 import { handleMessages, listModels, countTokens } from './handler.js';
 import { handleOpenAIChatCompletions, handleOpenAIResponses } from './openai-handler.js';
-import { renderHomePage } from './ui.js';
-import { renderLogsPage } from './log-ui.js';
-import {
-    clearLogs,
-    getLogStats,
-    getLogsSince,
-    getRecentLogs,
-    installConsoleCapture,
-    onLog,
-} from './logs.js';
+import { serveLogViewer, apiGetLogs, apiGetRequests, apiGetStats, apiGetPayload, apiLogsStream, serveLogViewerLogin, apiClearLogs } from './log-viewer.js';
+import { loadLogsFromFiles } from './logger.js';
 
 // 从 package.json 读取版本号，统一来源，避免多处硬编码
 const require = createRequire(import.meta.url);
@@ -29,20 +21,6 @@ const { version: VERSION } = require('../package.json') as { version: string };
 
 const app = express();
 const config = getConfig();
-
-installConsoleCapture();
-
-function getBaseUrl(req: express.Request): string {
-    const forwardedProto = req.headers['x-forwarded-proto'];
-    const forwardedHost = req.headers['x-forwarded-host'];
-    const proto = (typeof forwardedProto === 'string' ? forwardedProto : '')
-        .split(',')[0]
-        .trim() || req.protocol;
-    const host = (typeof forwardedHost === 'string' ? forwardedHost : '')
-        .split(',')[0]
-        .trim() || req.get('host') || `localhost:${config.port}`;
-    return `${proto}://${host}`;
-}
 
 // 解析 JSON body（增大限制以支持 base64 图片，单张图片可达 10MB+）
 app.use(express.json({ limit: '50mb' }));
@@ -59,13 +37,61 @@ app.use((_req, res, next) => {
     next();
 });
 
-// 简单访问日志（可在 /logs 中实时查看）
+// ★ 静态文件路由（无需鉴权，CSS/JS 等）
+app.use('/public', express.static('public'));
+
+// ★ 日志查看器鉴权中间件：配置了 authTokens 时需要验证
+const logViewerAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const tokens = getConfig().authTokens;
+    if (!tokens || tokens.length === 0) return next(); // 未配置 token 则放行
+
+    // 支持多种传入方式: query ?token=xxx, Authorization header, x-api-key header
+    const tokenFromQuery = req.query.token as string | undefined;
+    const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
+    const tokenFromHeader = authHeader ? String(authHeader).replace(/^Bearer\s+/i, '').trim() : undefined;
+    const token = tokenFromQuery || tokenFromHeader;
+
+    if (!token || !tokens.includes(token)) {
+        // HTML 页面请求 → 返回登录页; API 请求 → 返回 JSON 错误
+        if (req.path === '/logs') {
+            return serveLogViewerLogin(req, res);
+        }
+        res.status(401).json({ error: { message: 'Unauthorized. Provide token via ?token=xxx or Authorization header.', type: 'auth_error' } });
+        return;
+    }
+    next();
+};
+
+// ★ 日志查看器路由（带鉴权）
+app.get('/logs', logViewerAuth, serveLogViewer);
+app.get('/api/logs', logViewerAuth, apiGetLogs);
+app.get('/api/requests', logViewerAuth, apiGetRequests);
+app.get('/api/stats', logViewerAuth, apiGetStats);
+app.get('/api/payload/:requestId', logViewerAuth, apiGetPayload);
+app.get('/api/logs/stream', logViewerAuth, apiLogsStream);
+app.post('/api/logs/clear', logViewerAuth, apiClearLogs);
+
+// ★ API 鉴权中间件：配置了 authTokens 则需要 Bearer token
 app.use((req, res, next) => {
-    const startedAt = Date.now();
-    res.on('finish', () => {
-        const ms = Date.now() - startedAt;
-        console.log(`[HTTP] ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`);
-    });
+    // 跳过无需鉴权的路径
+    if (req.method === 'GET' || req.path === '/health') {
+        return next();
+    }
+    const tokens = getConfig().authTokens;
+    if (!tokens || tokens.length === 0) {
+        return next(); // 未配置 token 则全部放行
+    }
+    const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
+    if (!authHeader) {
+        res.status(401).json({ error: { message: 'Missing authentication token. Use Authorization: Bearer <token>', type: 'auth_error' } });
+        return;
+    }
+    const token = String(authHeader).replace(/^Bearer\s+/i, '').trim();
+    if (!tokens.includes(token)) {
+        console.log(`[Auth] 拒绝无效 token: ${token.substring(0, 8)}...`);
+        res.status(403).json({ error: { message: 'Invalid authentication token', type: 'auth_error' } });
+        return;
+    }
     next();
 });
 
@@ -97,17 +123,6 @@ app.get('/health', (_req, res) => {
 
 // 根路径
 app.get('/', (_req, res) => {
-    const accept = _req.get('accept') || '';
-    // 仅在浏览器显式声明接受 HTML 时才返回 UI。
-    // 避免 curl/脚本默认的 "*/*" 被协商为 HTML，导致根路径 JSON 变更。
-    if (accept.includes('text/html')) {
-        res.type('html').send(renderHomePage({
-            version: VERSION,
-            baseUrl: getBaseUrl(_req),
-            model: config.cursorModel,
-        }));
-        return;
-    }
     res.json({
         name: 'cursor2api',
         version: VERSION,
@@ -118,6 +133,7 @@ app.get('/', (_req, res) => {
             openai_responses: 'POST /v1/responses',
             models: 'GET /v1/models',
             health: 'GET /health',
+            log_viewer: 'GET /logs',
         },
         usage: {
             claude_code: 'export ANTHROPIC_BASE_URL=http://localhost:' + config.port,
@@ -127,107 +143,47 @@ app.get('/', (_req, res) => {
     });
 });
 
-// 可选：显式 UI 路由（不依赖 Accept 头）
-app.get('/ui', (req, res) => {
-    res.type('html').send(renderHomePage({
-        version: VERSION,
-        baseUrl: getBaseUrl(req),
-        model: config.cursorModel,
-    }));
-});
-
-// Logs UI
-app.get('/logs', (req, res) => {
-    res.type('html').send(renderLogsPage({
-        version: VERSION,
-        baseUrl: getBaseUrl(req),
-        model: config.cursorModel,
-        stats: getLogStats(),
-        recent: getRecentLogs(200),
-    }));
-});
-
-// ==================== Logs API ====================
-
-app.get('/api/logs', (req, res) => {
-    const limitRaw = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
-    const sinceIdRaw = Array.isArray(req.query.sinceId) ? req.query.sinceId[0] : req.query.sinceId;
-    const limit = Math.min(2000, Math.max(1, parseInt(String(limitRaw ?? '200'), 10) || 200));
-    const sinceId = parseInt(String(sinceIdRaw ?? '0'), 10) || 0;
-
-    const logs = sinceId > 0 ? getLogsSince(sinceId) : getRecentLogs(limit);
-    res.json({ stats: getLogStats(), logs });
-});
-
-app.post('/api/logs/clear', (_req, res) => {
-    clearLogs();
-    res.json({ ok: true, stats: getLogStats() });
-});
-
-app.get('/api/logs/stream', (req, res) => {
-    const sinceIdRaw = Array.isArray(req.query.sinceId) ? req.query.sinceId[0] : req.query.sinceId;
-    const sinceId = parseInt(String(sinceIdRaw ?? '0'), 10) || 0;
-
-    res.status(200);
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    const flushHeaders = (res as unknown as { flushHeaders?: () => void }).flushHeaders;
-    if (typeof flushHeaders === 'function') flushHeaders.call(res);
-
-    const send = (event: string, data: unknown) => {
-        try {
-            res.write(`event: ${event}\n`);
-            res.write(`data: ${JSON.stringify(data)}\n\n`);
-        } catch {
-            // ignore
-        }
-    };
-
-    // 先补发 sinceId 之后的日志
-    for (const entry of getLogsSince(sinceId)) {
-        send('log', entry);
-    }
-    send('stats', getLogStats());
-
-    const off = onLog(entry => send('log', entry));
-    const statsTimer = setInterval(() => send('stats', getLogStats()), 5000);
-    const heartbeatTimer = setInterval(() => {
-        try {
-            res.write(`: ping\n\n`);
-        } catch {
-            // ignore
-        }
-    }, 15000);
-
-    req.on('close', () => {
-        clearInterval(statsTimer);
-        clearInterval(heartbeatTimer);
-        off();
-    });
-});
-
 // ==================== 启动 ====================
 
+// ★ 从日志文件加载历史（必须在 listen 之前）
+loadLogsFromFiles();
+
 app.listen(config.port, () => {
+    const auth = config.authTokens?.length ? `${config.authTokens.length} token(s)` : 'open';
+    const logPersist = config.logging?.file_enabled ? `file → ${config.logging.dir}` : 'memory only';
+    
+    // Tools 配置摘要
+    const toolsCfg = config.tools;
+    let toolsInfo = 'default (full, desc=full)';
+    if (toolsCfg) {
+        const parts: string[] = [];
+        parts.push(`schema=${toolsCfg.schemaMode}`);
+        parts.push(toolsCfg.descriptionMaxLength === 0 ? 'desc=full' : `desc≤${toolsCfg.descriptionMaxLength}`);
+        if (toolsCfg.includeOnly?.length) parts.push(`whitelist=${toolsCfg.includeOnly.length}`);
+        if (toolsCfg.exclude?.length) parts.push(`blacklist=${toolsCfg.exclude.length}`);
+        toolsInfo = parts.join(', ');
+    }
+    
     console.log('');
-    console.log('  ╔══════════════════════════════════════╗');
-    console.log(`  ║        Cursor2API v${VERSION.padEnd(21)}║`);
-    console.log('  ╠══════════════════════════════════════╣');
-    console.log(`  ║  Server:  http://localhost:${config.port}      ║`);
-    console.log('  ║  Model:   ' + config.cursorModel.padEnd(26) + '║');
-    console.log('  ╠══════════════════════════════════════╣');
-    console.log('  ║  API Endpoints:                      ║');
-    console.log('  ║  • Anthropic: /v1/messages            ║');
-    console.log('  ║  • OpenAI:   /v1/chat/completions     ║');
-    console.log('  ║  • Cursor:   /v1/responses            ║');
-    console.log('  ╠══════════════════════════════════════╣');
-    console.log('  ║  Claude Code:                        ║');
-    console.log(`  ║  export ANTHROPIC_BASE_URL=           ║`);
-    console.log(`  ║    http://localhost:${config.port}              ║`);
-    console.log('  ║  OpenAI / Cursor IDE:                 ║');
-    console.log(`  ║  OPENAI_BASE_URL=                     ║`);
-    console.log(`  ║    http://localhost:${config.port}/v1            ║`);
-    console.log('  ╚══════════════════════════════════════╝');
+    console.log(`  \x1b[36m⚡ Cursor2API v${VERSION}\x1b[0m`);
+    console.log(`  ├─ Server:  \x1b[32mhttp://localhost:${config.port}\x1b[0m`);
+    console.log(`  ├─ Model:   ${config.cursorModel}`);
+    console.log(`  ├─ Auth:    ${auth}`);
+    console.log(`  ├─ Tools:   ${toolsInfo}`);
+    console.log(`  ├─ Logging: ${logPersist}`);
+    console.log(`  └─ Logs:    \x1b[35mhttp://localhost:${config.port}/logs\x1b[0m`);
     console.log('');
+
+    // ★ 启动 config.yaml 热重载监听
+    initConfigWatcher();
+});
+
+// ★ 优雅关闭：停止文件监听
+process.on('SIGTERM', () => {
+    stopConfigWatcher();
+    process.exit(0);
+});
+process.on('SIGINT', () => {
+    stopConfigWatcher();
+    process.exit(0);
 });

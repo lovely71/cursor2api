@@ -15,35 +15,7 @@ node_modules/
 # IDE
 .idea/
 .vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-logs/
-*.log
-
-# Environment
-# Binaries
-*.exe
-*.dll
-*.so
-*.dylib
-cursor2api
-
-# Go
-vendor/
-*.test
-
-# Node
-node_modules/
-
-# IDE
-.idea/
-.vscode/
+.cursor/
 *.swp
 *.swo
 
@@ -63,3 +35,15 @@ logs/
 dist/
 build/
 *.traineddata
+
+# Config (contains sensitive tokens, use config.yaml.example as template)
+config.yaml
+
+# Screenshots (dev artifacts)
+*.png
+# Test result artifacts
+test/*-results*.json
+test/ctf-*-results.json
+
+# Claude local settings
+.claude/

@@ -4,6 +4,7 @@ export interface OpenAIChatRequest {
     model: string;
     messages: OpenAIMessage[];
     stream?: boolean;
+    stream_options?: { include_usage?: boolean };
     temperature?: number;
     top_p?: number;
     max_tokens?: number;
@@ -14,6 +15,10 @@ export interface OpenAIChatRequest {
     n?: number;
     frequency_penalty?: number;
     presence_penalty?: number;
+    response_format?: {
+        type: 'text' | 'json_object' | 'json_schema';
+        json_schema?: { name?: string; schema?: Record<string, unknown> };
+    };
 }
 
 export interface OpenAIMessage {
@@ -27,9 +32,12 @@ export interface OpenAIMessage {
 }
 
 export interface OpenAIContentPart {
-    type: 'text' | 'image_url';
+    type: 'text' | 'input_text' | 'image_url' | 'image' | 'input_image' | 'image_file';
     text?: string;
     image_url?: { url: string; detail?: string };
+    image_file?: { file_id: string; detail?: string };
+    // Anthropic-style image source (when type === 'image')
+    source?: { type: string; media_type?: string; data?: string; url?: string };
 }
 
 export interface OpenAITool {
@@ -83,6 +91,11 @@ export interface OpenAIChatCompletionChunk {
     created: number;
     model: string;
     choices: OpenAIStreamChoice[];
+    usage?: {
+        prompt_tokens: number;
+        completion_tokens: number;
+        total_tokens: number;
+    };
 }
 
 export interface OpenAIStreamChoice {

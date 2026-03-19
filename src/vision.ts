@@ -1,57 +1,77 @@
 import { getConfig } from './config.js';
 import type { AnthropicMessage, AnthropicContentBlock } from './types.js';
-import { getProxyFetchOptions } from './proxy-agent.js';
+import { getVisionProxyFetchOptions } from './proxy-agent.js';
 import { createWorker } from 'tesseract.js';
 
 export async function applyVisionInterceptor(messages: AnthropicMessage[]): Promise<void> {
     const config = getConfig();
     if (!config.vision?.enabled) return;
 
-    for (const msg of messages) {
-        if (!Array.isArray(msg.content)) continue;
-
-        let hasImages = false;
-        const newContent: AnthropicContentBlock[] = [];
-        const imagesToAnalyze: AnthropicContentBlock[] = [];
-
-        for (const block of msg.content) {
-            if (block.type === 'image') {
-                hasImages = true;
-                imagesToAnalyze.push(block);
-            } else {
-                newContent.push(block);
-            }
+    // ★ 仅处理最后一条 user 消息中的图片
+    //   历史消息的图片已在前几轮被转换为文本描述，无需重复处理
+    //   这避免了多轮对话中重复消耗 Vision API 配额和增加延迟
+    let lastUserMsg: AnthropicMessage | null = null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+            lastUserMsg = messages[i];
+            break;
         }
+    }
 
-        if (hasImages && imagesToAnalyze.length > 0) {
-            try {
-                let descriptions = '';
-                if (config.vision.mode === 'ocr') {
-                    console.log(`[Vision] 启用纯本地 OCR 模式，正在提取 ${imagesToAnalyze.length} 张图片上的文字... (无需 API Key)`);
-                    descriptions = await processWithLocalOCR(imagesToAnalyze);
-                } else {
-                    console.log(`[Vision] 启用外部 API 模式，正在分析 ${imagesToAnalyze.length} 张图片...`);
-                    descriptions = await callVisionAPI(imagesToAnalyze);
-                }
+    if (!lastUserMsg || !Array.isArray(lastUserMsg.content)) return;
 
-                // Add descriptions as a simulated system text block
+    let hasImages = false;
+    const newContent: AnthropicContentBlock[] = [];
+    const imagesToAnalyze: AnthropicContentBlock[] = [];
+
+    for (const block of lastUserMsg.content) {
+        if (block.type === 'image') {
+            // ★ 跳过 SVG 矢量图 — tesseract.js 无法处理 SVG，会导致进程崩溃 (#69)
+            const mediaType = (block as any).source?.media_type || '';
+            if (mediaType === 'image/svg+xml') {
+                console.log('[Vision] ⚠️ 跳过 SVG 矢量图（不支持 OCR/Vision 处理）');
                 newContent.push({
                     type: 'text',
-                    text: `\n\n[System: The user attached ${imagesToAnalyze.length} image(s). Visual analysis/OCR extracted the following context:\n${descriptions}]\n\n`
+                    text: '[SVG vector image was attached but cannot be processed by OCR/Vision. It likely contains a logo, icon, badge, or diagram.]',
                 });
-
-                msg.content = newContent;
-            } catch (e) {
-                console.error("[Vision API Error]", e);
-                newContent.push({
-                    type: 'text',
-                    text: `\n\n[System: The user attached image(s), but the Vision interceptor failed to process them. Error: ${(e as Error).message}]\n\n`
-                });
-                msg.content = newContent;
+                continue;
             }
+            hasImages = true;
+            imagesToAnalyze.push(block);
+        } else {
+            newContent.push(block);
+        }
+    }
+
+    if (hasImages && imagesToAnalyze.length > 0) {
+        try {
+            let descriptions = '';
+            if (config.vision.mode === 'ocr') {
+                descriptions = await processWithLocalOCR(imagesToAnalyze);
+            } else {
+                descriptions = await callVisionAPI(imagesToAnalyze);
+            }
+
+            // Add descriptions as a simulated system text block
+            newContent.push({
+                type: 'text',
+                text: `\n\n[System: The user attached ${imagesToAnalyze.length} image(s). Visual analysis/OCR extracted the following context:\n${descriptions}]\n\n`
+            });
+
+            lastUserMsg.content = newContent;
+        } catch (e) {
+            console.error("[Vision API Error]", e);
+            newContent.push({
+                type: 'text',
+                text: `\n\n[System: The user attached image(s), but the Vision interceptor failed to process them. Error: ${(e as Error).message}]\n\n`
+            });
+            lastUserMsg.content = newContent;
         }
     }
 }
+
+// ★ 不支持 OCR 的图片格式（矢量图、动画等）
+const UNSUPPORTED_OCR_TYPES = new Set(['image/svg+xml']);
 
 async function processWithLocalOCR(imageBlocks: AnthropicContentBlock[]): Promise<string> {
     const worker = await createWorker('eng+chi_sim');
@@ -61,12 +81,18 @@ async function processWithLocalOCR(imageBlocks: AnthropicContentBlock[]): Promis
         const img = imageBlocks[i];
         let imageSource: string | Buffer = '';
 
-        if (img.type === 'image' && img.source?.data) {
-            if (img.source.type === 'base64') {
+        if (img.type === 'image' && img.source) {
+            // ★ 防御性检查：跳过不支持 OCR 的格式（#69 - SVG 导致 tesseract 崩溃）
+            if (UNSUPPORTED_OCR_TYPES.has(img.source.media_type || '')) {
+                combinedText += `--- Image ${i + 1} ---\n(Skipped: ${img.source.media_type} format is not supported by OCR)\n\n`;
+                continue;
+            }
+            const sourceData = img.source.data || img.source.url;
+            if (img.source.type === 'base64' && sourceData) {
                 const mime = img.source.media_type || 'image/jpeg';
-                imageSource = `data:${mime};base64,${img.source.data}`;
-            } else if (img.source.type === 'url') {
-                imageSource = img.source.data;
+                imageSource = `data:${mime};base64,${sourceData}`;
+            } else if (img.source.type === 'url' && sourceData) {
+                imageSource = sourceData;
             }
         }
 
@@ -94,15 +120,16 @@ async function callVisionAPI(imageBlocks: AnthropicContentBlock[]): Promise<stri
     ];
 
     for (const img of imageBlocks) {
-        if (img.type === 'image' && img.source?.data) {
+        if (img.type === 'image' && img.source) {
+            const sourceData = img.source.data || img.source.url;
             let url = '';
             // If it's a raw base64 string
-            if (img.source.type === 'base64') {
+            if (img.source.type === 'base64' && sourceData) {
                 const mime = img.source.media_type || 'image/jpeg';
-                url = `data:${mime};base64,${img.source.data}`;
-            } else if (img.source.type === 'url') {
-                // Handle remote URLs natively mapped from OpenAI payloads
-                url = img.source.data;
+                url = `data:${mime};base64,${sourceData}`;
+            } else if (img.source.type === 'url' && sourceData) {
+                // Handle remote URLs natively mapped from OpenAI/Anthropic payloads
+                url = sourceData;
             }
             if (url) {
                 parts.push({ type: 'image_url', image_url: { url } });
@@ -123,7 +150,7 @@ async function callVisionAPI(imageBlocks: AnthropicContentBlock[]): Promise<stri
             'Authorization': `Bearer ${config.apiKey}`
         },
         body: JSON.stringify(payload),
-        ...getProxyFetchOptions(),
+        ...getVisionProxyFetchOptions(),
     } as any);
 
     if (!res.ok) {
