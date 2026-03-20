@@ -2,7 +2,7 @@
 
 将 Cursor 文档页免费 AI 对话接口代理转换为 **Anthropic Messages API** 和 **OpenAI Chat Completions API**，支持 **Claude Code** 和 **Cursor IDE** 使用。
 
-> ⚠️ **版本说明**：当前版本为 v2.7.6，已包含常量集中管理、自定义拒绝规则、响应清洗开关等改进。
+> ⚠️ **版本说明**：当前 v2.7.6 新增工具透传模式（passthrough）、工具禁用模式（disabled）、身份泄漏清洗增强和 `tool_choice=any` 引导优化。
 
 ## 原理
 
@@ -83,6 +83,8 @@ cp config.yaml.example config.yaml
 | `max_auto_continue` | 截断自动续写次数 (`0`=禁用，交由客户端续写) | `0` |
 | `sanitize_response` | 响应内容清洗开关（替换 Cursor 身份引用为 Claude） | `false` |
 | `refusal_patterns` | 自定义拒绝检测规则列表（追加到内置规则） | 不配置 |
+| `tools.passthrough` | 🆕 透传模式：跳过 few-shot 注入，原始 JSON 嵌入（Roo Code/Cline 推荐） | `false` |
+| `tools.disabled` | 🆕 禁用模式：完全不注入工具定义，极致省上下文 | `false` |
 
 > 💡 详细配置说明请参见 `config.yaml.example` 中的注释。
 
@@ -94,163 +96,6 @@ npm run dev
 
 # 生产模式
 npm run build && npm start
-```
-
-启动后可打开浏览器查看 UI：
-
-- 信息面板：`http://localhost:3010/ui`
-- 实时日志：`http://localhost:3010/logs`
-
-> 说明：浏览器访问根路径 `/` 默认会返回 HTML；脚本/CLI（如 curl）访问 `/` 默认仍返回 JSON。
-
-## Docker
-
-### 直接部署（GHCR 镜像）
-
-项目已通过 GitHub Actions 自动构建并推送镜像到 GHCR：
-
-```bash
-docker pull ghcr.io/lovely71/cursor2api:latest
-```
-
-> 说明：GHCR 页面里看到的 `unknown/unknown` 通常是 **OCI Image Index / Manifest List**（多架构镜像清单），不是实际可运行的 CPU 架构。
-> 真正可运行的架构会显示为 `linux/amd64`、`linux/arm64`、`linux/arm/v7` 等。
-
-运行（推荐挂载配置文件）：
-
-```bash
-docker run -d --name cursor2api \
-  --restart unless-stopped \
-  -p 3010:3010 \
-  -v ./config.yaml:/app/config.yaml:ro \
-  -e NODE_ENV=production \
-  ghcr.io/lovely71/cursor2api:latest
-```
-
-启动后访问：
-
-- 信息面板：`http://localhost:3010/ui`
-- 实时日志：`http://localhost:3010/logs`
-
-> 如果镜像仓库是私有的，需要先登录：`docker login ghcr.io`（使用 GitHub PAT，需具备 Packages 读取权限）。
-
-### docker compose 部署（推荐）
-
-参考配置（将其保存为 `docker-compose.yml`，或按需合并到现有 compose 文件）：
-
-```yaml
-services:
-  cursor2api:
-    image: ghcr.io/lovely71/cursor2api:latest
-    container_name: cursor2api
-    restart: unless-stopped
-    ports:
-      - "3010:3010"
-    volumes:
-      # 配置文件持久化（推荐）
-      - ./config.yaml:/app/config.yaml:ro
-    environment:
-      - NODE_ENV=production
-      # 可选：用环境变量覆盖 config.yaml
-      # - PORT=3010
-      # - TIMEOUT=120
-      # - CURSOR_MODEL=anthropic/claude-sonnet-4.6
-      # - PROXY=http://user:pass@127.0.0.1:7890
-```
-
-启动：
-
-```bash
-docker compose up -d
-```
-
-### ClawCloud Run（claw.cloud）部署指南
-
-> 适合不想自己运维服务器的场景：直接使用 GHCR 镜像部署。
-
-1) 创建应用
-
-- 打开 ClawCloud Run 控制台：`https://console.run.claw.cloud`
-- 进入 **App Launchpad** → **Create APP**
-- Application Type 选择 **Docker Image**
-
-2) 镜像与端口
-
-- Image Type：`Public`
-- Image Name：`ghcr.io/lovely71/cursor2api:latest`
-- Network / Container Port：`3010`（HTTP）
-
-3) 环境变量（可选）
-
-在 **Environment Variables** 中按行粘贴（每行一个）：
-
-```bash
-NODE_ENV=production
-PORT=3010
-TIMEOUT=120
-
-# 可选：模型名/代理
-# CURSOR_MODEL=anthropic/claude-sonnet-4.6
-# PROXY=http://user:pass@127.0.0.1:7890
-```
-
-4) 配置文件（推荐）
-
-在 **Configuration Files** 中新增一个文件（用于替代 Docker 的 volume 挂载）：
-
-- Container Path：`/app/config.yaml`
-- Content：复制本仓库的 `config.yaml` 内容并按需修改
-
-5) 健康检查与访问
-
-- 如平台需要配置 Health Check，建议使用：`GET /health`（避免出现 `no healthy upstream`）
-- 部署完成后，打开平台分配的域名：
-  - `/ui`：信息面板
-  - `/logs`：实时日志
-
-6) 持久化存储（一般不需要）
-
-本服务本身是无状态的，通常不需要挂载 **Persistent Storage**。
-
-- 不建议把存储卷挂载到 `/app`（会覆盖镜像内程序文件导致无法启动）
-- 如确需持久化目录，建议挂载到 `/data` 并在你自己的业务逻辑中使用
-
-参考文档：
-
-- [App Launchpad](https://docs.run.claw.cloud/clawcloud-run/guide/app-launchpad)
-- [Environment Variables](https://docs.run.claw.cloud/clawcloud-run/guide/app-launchpad/environment-variables)
-- [Configuration Files](https://docs.run.claw.cloud/clawcloud-run/guide/app-launchpad/configuration-files)
-- [Persistent Storage](https://docs.run.claw.cloud/clawcloud-run/guide/app-launchpad/persistent-storage)
-
-### 存储路径（需要挂载什么？）
-
-本项目整体是**无状态**的：不需要数据库或磁盘存储。
-
-- **必须/推荐**：`/app/config.yaml`（挂载你的配置文件，便于修改配置后 `docker restart` 生效）
-- **可选**：如果只想通过环境变量配置，也可以不挂载 `config.yaml`
-
-### 环境变量说明
-
-这些变量会覆盖 `config.yaml` 中对应项：
-
-- `PORT`：监听端口（默认 `3010`）
-- `TIMEOUT`：空闲超时秒数（默认 `120`）
-- `CURSOR_MODEL`：Cursor 使用的模型名（如 `anthropic/claude-sonnet-4.6`）
-- `PROXY`：HTTP/HTTPS 代理（让 Node.js fetch 走代理；国内机房常用）
-- `FP`：base64 编码的浏览器指纹 JSON（目前主要支持 `userAgent`）
-
-### 部署建议（安全）
-
-由于本服务默认开放 CORS 且可被当作公开代理使用，**不建议直接暴露到公网**。建议：
-
-- 仅在内网使用，或配合反向代理做鉴权（Basic Auth / IP 白名单 / Zero Trust）
-- 配置防火墙或安全组，仅允许自己的客户端访问
-- 如需公网部署，至少加访问控制和限流
-
-### 本地构建与运行（开发/自定义）
-
-```bash
-docker compose up -d --build
 ```
 
 ### 4. 配合 Claude Code 使用
@@ -404,6 +249,8 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 | `LOG_DIR` | 日志文件目录 |
 | `MAX_AUTO_CONTINUE` | 截断自动续写次数 (`0`=禁用) |
 | `SANITIZE_RESPONSE` | 响应内容清洗开关 (`true`/`false`，默认 `false`) |
+| `TOOLS_PASSTHROUGH` | 🆕 工具透传模式 (`true`/`false`，默认 `false`) |
+| `TOOLS_DISABLED` | 🆕 工具禁用模式 (`true`/`false`，默认 `false`) |
 
 ## 免责声明 / Disclaimer
 
