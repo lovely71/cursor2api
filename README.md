@@ -1,8 +1,8 @@
-# Cursor2API v2.7.5
+# Cursor2API v2.7.6
 
 将 Cursor 文档页免费 AI 对话接口代理转换为 **Anthropic Messages API** 和 **OpenAI Chat Completions API**，支持 **Claude Code** 和 **Cursor IDE** 使用。
 
-> ⚠️ **版本说明**：当前 v2.7.5 新增常量集中管理、自定义拒绝规则、响应清洗开关，代码可维护性大幅提升。
+> ⚠️ **版本说明**：当前版本为 v2.7.6，已包含常量集中管理、自定义拒绝规则、响应清洗开关等改进。
 
 ## 原理
 
