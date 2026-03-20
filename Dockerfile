@@ -6,7 +6,8 @@ WORKDIR /app
 
 # 仅拷贝包配置并安装所有依赖项（利用 Docker 缓存层）
 COPY package.json package-lock.json ./
-RUN npm ci
+# 跨架构 buildx/QEMU 下安装脚本偶发触发非法指令；本项目构建不依赖这些脚本
+RUN npm ci --ignore-scripts
 
 # 拷贝项目源代码并执行 TypeScript 编译
 COPY tsconfig.json ./
@@ -27,7 +28,7 @@ RUN addgroup --system --gid 1001 nodejs && \
 
 # 拷贝包配置并仅安装生产环境依赖（极大减小镜像体积）
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev \
+RUN npm ci --omit=dev --ignore-scripts \
     && npm cache clean --force
 
 # 从 builder 阶段拷贝编译后的产物
