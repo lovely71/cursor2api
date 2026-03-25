@@ -20,6 +20,7 @@ import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converte
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
 import { createRequestLogger, type RequestLogger } from './logger.js';
+import { estimateTokens } from './tokenizer.js';
 import { createIncrementalTextStreamer, hasLeadingThinking, splitLeadingThinkingBlocks, stripThinkingTags } from './streaming-text.js';
 
 function msgId(): string {
@@ -96,27 +97,41 @@ export function listModels(_req: Request, res: Response): void {
 
 // ==================== Token 计数 ====================
 
+/**
+ * 对实际发往 Cursor 的完整消息内容做 token 估算（用于与 Cursor 返回值对比）
+ */
+export function estimateCursorReqTokens(cursorReq: CursorChatRequest): number {
+    let total = 0;
+    for (const msg of cursorReq.messages) {
+        for (const part of msg.parts) {
+            total += estimateTokens(part.text ?? '');
+        }
+    }
+    return total;
+}
+
 export function estimateInputTokens(body: AnthropicRequest): number {
-    let totalChars = 0;
+    let total = 0;
 
     if (body.system) {
-        totalChars += typeof body.system === 'string' ? body.system.length : JSON.stringify(body.system).length;
+        const sysStr = typeof body.system === 'string' ? body.system : JSON.stringify(body.system);
+        total += estimateTokens(sysStr);
     }
-    
+
     for (const msg of body.messages ?? []) {
-        totalChars += typeof msg.content === 'string' ? msg.content.length : JSON.stringify(msg.content).length;
+        const msgStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+        total += estimateTokens(msgStr);
     }
 
     // Tool schemas are heavily compressed by compactSchema in converter.ts.
-    // However, they still consume Cursor's context budget. 
+    // However, they still consume Cursor's context budget.
     // If not counted, Claude CLI will dangerously underestimate context size.
     if (body.tools && body.tools.length > 0) {
-        totalChars += body.tools.length * 200; // ~200 chars per compressed tool signature
-        totalChars += 1000; // Tool use guidelines and behavior instructions
+        total += body.tools.length * 70; // ~200 chars/tool → ~70 tokens after compression
+        total += 350;                    // Tool use guidelines and behavior instructions
     }
-    
-    // Safer estimation for mixed Chinese/English and Code: 1 token ≈ 3 chars + 10% safety margin.
-    return Math.max(1, Math.ceil((totalChars / 3) * 1.1));
+
+    return Math.max(1, total);
 }
 
 export function countTokens(req: Request, res: Response): void {
@@ -464,6 +479,50 @@ function toolCallNeedsMoreContinuation(toolCall: ParsedToolCall): boolean {
     return false;
 }
 
+function getLargePayloadText(toolCall: ParsedToolCall): string {
+    for (const key of ['content', 'new_string', 'new_str', 'text', 'file_text', 'code', 'command']) {
+        const value = toolCall.arguments?.[key];
+        if (typeof value === 'string' && value.length > 0) return value;
+    }
+    return '';
+}
+
+function payloadLooksSemanticallyIncomplete(payload: string): boolean {
+    const trimmed = payload.trimEnd();
+    if (trimmed.length < 1200) return false;
+
+    const fenceCount = (trimmed.match(/^```/gm) || []).length;
+    if (fenceCount % 2 !== 0) return true;
+
+    const lastNonEmptyLine = trimmed
+        .split('\n')
+        .reverse()
+        .find(line => line.trim().length > 0)
+        ?.trim() || '';
+
+    if (!lastNonEmptyLine) return false;
+    if (lastNonEmptyLine === '|') return true;
+
+    if (lastNonEmptyLine.startsWith('|')) {
+        const pipeCount = (lastNonEmptyLine.match(/\|/g) || []).length;
+        if (pipeCount < 3) return true;
+    }
+
+    if (/^([-*+]|\d+\.)\s*$/.test(lastNonEmptyLine)) return true;
+    if (/[,;:\[{(]\s*$/.test(lastNonEmptyLine)) return true;
+
+    const likelyDanglingToken = /^[\p{L}\p{N}_./`-]{1,16}$/u.test(lastNonEmptyLine)
+        && !/[.!?;:。！？`"'”’)\]}]$/.test(lastNonEmptyLine);
+    if (likelyDanglingToken) return true;
+
+    return false;
+}
+
+function toolCallLooksSemanticallyIncomplete(toolCall: ParsedToolCall): boolean {
+    if (!toolCallNeedsMoreContinuation(toolCall)) return false;
+    return payloadLooksSemanticallyIncomplete(getLargePayloadText(toolCall));
+}
+
 /**
  * 截断不等于必须续写。
  *
@@ -476,13 +535,47 @@ function toolCallNeedsMoreContinuation(toolCall: ParsedToolCall): boolean {
  * 2. 已恢复出的工具调用明显属于大参数写入类，需要继续补全内容
  */
 export function shouldAutoContinueTruncatedToolResponse(text: string, hasTools: boolean): boolean {
-    if (!hasTools || !isTruncated(text)) return false;
+    if (!hasTools) return false;
+
+    if (!isTruncated(text)) {
+        if (!hasToolCalls(text)) return false;
+
+        const { toolCalls } = parseToolCalls(text);
+        if (toolCalls.length === 0) return false;
+
+        return toolCalls.some(toolCallLooksSemanticallyIncomplete);
+    }
+
+    // ★ json action 块未闭合是最精确的截断信号，不受长度限制影响
+    // isTruncated 在有 json action 块时 early return：全闭合→false，未闭合→true
+    // 所以此处 isTruncated=true 且有开标签，必然意味着 action 块未闭合，无需重复计数
+    const hasUnclosedActionBlock = (text.match(/```json\s+action/g) || []).length > 0;
+    // 响应过短（< 200 chars）时不触发续写：上下文不足会导致模型拒绝或错误续写
+    // 例外：json action 块明确未闭合时跳过此检查（thinking 剥离后正文可能很短）
+    if (!hasUnclosedActionBlock && text.trim().length < 200) return false;
     if (!hasToolCalls(text)) return true;
 
     const { toolCalls } = parseToolCalls(text);
     if (toolCalls.length === 0) return true;
 
     return toolCalls.some(toolCallNeedsMoreContinuation);
+}
+
+// ==================== 续写辅助 ====================
+
+/**
+ * 为续写请求修复未闭合的 <thinking> 标签。
+ *
+ * 当 thinking 内容超出模型单次输出上限时，rawResponse 末尾是未闭合的
+ * <thinking>...partial 内容。把它作为 assistant context 发给模型时，
+ * 模型会把这段当成 thinking 继续输出，而不是续写正文。
+ * 在此统一补全 </thinking>，让模型知道思考阶段已结束，应续写正文。
+ */
+function closeUnclosedThinking(text: string): string {
+    const opens = (text.match(/<thinking>/g) || []).length;
+    const closes = (text.match(/<\/thinking>/g) || []).length;
+    if (opens > closes) return text + '</thinking>\n';
+    return text;
 }
 
 // ==================== 续写去重 ====================
@@ -564,7 +657,11 @@ export async function autoContinueCursorToolResponseStream(
     hasTools: boolean,
 ): Promise<string> {
     let fullResponse = initialResponse;
-    const MAX_AUTO_CONTINUE = getConfig().maxAutoContinue;
+    // OpenAI-compatible clients expect complete tool calls in one logical response.
+    // Unlike Claude Code, they generally cannot recover a truncated json action block
+    // by issuing a native follow-up continuation themselves, so we force at least
+    // one internal continuation attempt here.
+    const MAX_AUTO_CONTINUE = Math.max(getConfig().maxAutoContinue, 1);
     let continueCount = 0;
     let consecutiveSmallAdds = 0;
 
@@ -582,9 +679,11 @@ export async function autoContinueCursorToolResponseStream(
 
 Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
 
-        const assistantContext = fullResponse.length > 2000
-            ? '...\n' + fullResponse.slice(-2000)
-            : fullResponse;
+        const assistantContext = closeUnclosedThinking(
+            fullResponse.length > 2000
+                ? '...\n' + fullResponse.slice(-2000)
+                : fullResponse,
+        );
 
         const continuationReq: CursorChatRequest = {
             ...cursorReq,
@@ -637,7 +736,9 @@ export async function autoContinueCursorToolResponseFull(
     hasTools: boolean,
 ): Promise<string> {
     let fullText = initialText;
-    const MAX_AUTO_CONTINUE = getConfig().maxAutoContinue;
+    // Keep non-stream OpenAI-compatible tool responses aligned with the stream helper:
+    // always allow at least one internal continuation for truncated tool payloads.
+    const MAX_AUTO_CONTINUE = Math.max(getConfig().maxAutoContinue, 1);
     let continueCount = 0;
     let consecutiveSmallAdds = 0;
 
@@ -654,9 +755,11 @@ export async function autoContinueCursorToolResponseFull(
 
 Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
 
-        const assistantContext = fullText.length > 2000
-            ? '...\n' + fullText.slice(-2000)
-            : fullText;
+        const assistantContext = closeUnclosedThinking(
+            fullText.length > 2000
+                ? '...\n' + fullText.slice(-2000)
+                : fullText,
+        );
 
         const continuationReq: CursorChatRequest = {
             ...cursorReq,
@@ -675,7 +778,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             ],
         };
 
-        const continuationResponse = await sendCursorRequestFull(continuationReq);
+        const { text: continuationResponse } = await sendCursorRequestFull(continuationReq);
         if (continuationResponse.trim().length === 0) break;
 
         const deduped = deduplicateContinuation(fullText, continuationResponse);
@@ -803,6 +906,7 @@ async function handleDirectTextStream(
     let finalRawResponse = '';
     let finalVisibleText = '';
     let finalThinkingContent = '';
+    let cursorUsage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined;
     let streamer = createIncrementalTextStreamer({
         warmupChars: 300,   // ★ 与工具模式对齐：前 300 chars 不释放，确保拒绝检测完成后再流
         transform: sanitizeResponse,
@@ -843,6 +947,10 @@ async function handleDirectTextStream(
         log.startPhase('send', '发送到 Cursor');
 
         await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+            if (event.type === 'finish') {
+                if (event.messageMetadata?.usage) cursorUsage = event.messageMetadata.usage;
+                return;
+            }
             if (event.type !== 'text-delta' || !event.delta) return;
 
             if (firstChunk) {
@@ -895,6 +1003,11 @@ async function handleDirectTextStream(
             if (split.startedWithThinking && split.complete) {
                 thinkingContent = split.thinkingContent;
                 flushVisible(split.remainder);
+            } else if (split.startedWithThinking && !split.complete) {
+                // ★ thinking 未闭合（输出被截断在 thinking 阶段）
+                // 提取已积累的部分 thinking 内容，正文为空，避免 <thinking>...内容泄漏到正文
+                thinkingContent = split.thinkingContent;
+                // remainder 为空，不 flush 任何正文内容
             } else {
                 flushVisible(leadingBuffer);
             }
@@ -998,6 +1111,13 @@ async function handleDirectTextStream(
         ? sanitizeResponse(finalVisibleText)
         : finalTextToSend;
     log.recordFinalResponse(finalRecordedResponse);
+    const estimatedInput1 = estimateCursorReqTokens(activeCursorReq);
+    const actualInput1 = cursorUsage?.inputTokens;
+    console.log(`[TokenDiff] 流式(无工具) 估算(我们发的)=${estimatedInput1} Cursor实际=${actualInput1 ?? 'N/A'} Cursor隐藏开销=${actualInput1 != null ? (actualInput1 - estimatedInput1) : 'N/A'}`);
+    log.updateSummary({
+        inputTokens: cursorUsage?.inputTokens,
+        outputTokens: cursorUsage?.outputTokens,
+    });
     log.complete(finalRecordedResponse.length, 'end_turn');
 
     res.end();
@@ -1040,6 +1160,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
     let blockIndex = 0;
     let textBlockStarted = false;
     let thinkingBlockEmitted = false;
+    let cursorUsage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined;
 
     // 无工具模式：先缓冲全部响应再检测拒绝，如果是拒绝则重试
     let activeCursorReq = cursorReq;
@@ -1057,6 +1178,10 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
 
         try {
             await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+                if (event.type === 'finish') {
+                    if (event.messageMetadata?.usage) cursorUsage = event.messageMetadata.usage;
+                    return;
+                }
                 if (event.type !== 'text-delta' || !event.delta) return;
                 if (firstChunk) { log.recordTTFT(); log.endPhase(); log.startPhase('response', '接收响应'); firstChunk = false; }
                 fullResponse += event.delta;
@@ -1191,6 +1316,11 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             if (split.startedWithThinking && split.complete) {
                 hybridThinkingContent = split.thinkingContent;
                 pushToStreamer(split.remainder);
+            } else if (split.startedWithThinking && !split.complete) {
+                // ★ thinking 未闭合（输出被截断在 thinking 阶段）
+                // 提取部分 thinking 内容，不 push 到正文流，避免泄漏
+                hybridThinkingContent = split.thinkingContent;
+                // remainder 为空，不 push 任何正文内容
             } else {
                 pushToStreamer(hybridLeadingBuffer);
             }
@@ -1332,9 +1462,11 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
 
 Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
 
-            const assistantContext = fullResponse.length > 2000
-                ? '...\n' + fullResponse.slice(-2000)
-                : fullResponse;
+            const assistantContext = closeUnclosedThinking(
+                fullResponse.length > 2000
+                    ? '...\n' + fullResponse.slice(-2000)
+                    : fullResponse,
+            );
 
             activeCursorReq = {
                 ...activeCursorReq,
@@ -1421,6 +1553,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             blockIndex++;
         }
 
+        let toolCallsDetected = 0;
         if (hasTools) {
             // ★ 截断保护：如果响应被截断，不要解析不完整的工具调用
             // 直接作为纯文本返回 max_tokens，让客户端自行处理续写
@@ -1507,6 +1640,8 @@ Please go ahead and pick the most appropriate tool for the current task and outp
                 log.warn('Handler', 'toolparse', `tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
             }
 
+
+            toolCallsDetected = toolCalls.length;
 
             if (toolCalls.length > 0) {
                 stopReason = 'tool_use';
@@ -1642,6 +1777,14 @@ Please go ahead and pick the most appropriate tool for the current task and outp
 
         // ★ 记录完成
         log.recordFinalResponse(fullResponse);
+        const estimatedInput2 = estimateCursorReqTokens(activeCursorReq);
+        const actualInput2 = cursorUsage?.inputTokens;
+        console.log(`[TokenDiff] 流式(有工具) 估算(我们发的)=${estimatedInput2} Cursor实际=${actualInput2 ?? 'N/A'} Cursor隐藏开销=${actualInput2 != null ? (actualInput2 - estimatedInput2) : 'N/A'}`);
+        log.updateSummary({
+            inputTokens: cursorUsage?.inputTokens,
+            outputTokens: cursorUsage?.outputTokens,
+            toolCallsDetected,
+        });
         log.complete(fullResponse.length, stopReason);
 
     } catch (err: unknown) {
@@ -1675,7 +1818,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     try {
     log.startPhase('send', '发送到 Cursor (非流式)');
     const apiStart = Date.now();
-    let fullText = await sendCursorRequestFull(cursorReq);
+    let { text: fullText, usage: cursorUsage } = await sendCursorRequestFull(cursorReq);
     log.recordTTFT();
     log.recordCursorApiTime(apiStart);
     log.recordRawResponse(fullText);
@@ -1718,7 +1861,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
             log.updateSummary({ retryCount });
             const retryBody = buildRetryRequest(body, attempt);
             activeCursorReq = await convertToCursorRequest(retryBody);
-            fullText = await sendCursorRequestFull(activeCursorReq);
+            ({ text: fullText, usage: cursorUsage } = await sendCursorRequestFull(activeCursorReq));
             // 重试后也需要剥离 thinking 标签
             if (hasLeadingThinking(fullText)) {
                 const { thinkingContent: retryThinking, strippedText: retryStripped } = extractThinking(fullText);
@@ -1748,7 +1891,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
         retryCount++;
         log.warn('Handler', 'retry', `非流式响应过短 (${fullText.length} chars)，重试第${retryCount}次`);
         activeCursorReq = await convertToCursorRequest(body);
-        fullText = await sendCursorRequestFull(activeCursorReq);
+        ({ text: fullText, usage: cursorUsage } = await sendCursorRequestFull(activeCursorReq));
         log.info('Handler', 'retry', `非流式重试响应: ${fullText.length} chars`, { preview: fullText.substring(0, 200) });
     }
 
@@ -1781,7 +1924,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             messages: [
                 // ★ 续写优化：丢弃所有工具定义和历史消息
                 {
-                    parts: [{ type: 'text', text: fullText.length > 2000 ? '...\n' + fullText.slice(-2000) : fullText }],
+                    parts: [{ type: 'text', text: closeUnclosedThinking(fullText.length > 2000 ? '...\n' + fullText.slice(-2000) : fullText) }],
                     id: uuidv4(),
                     role: 'assistant',
                 },
@@ -1793,7 +1936,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             ],
         };
 
-        const continuationResponse = await sendCursorRequestFull(continuationReq);
+        const { text: continuationResponse } = await sendCursorRequestFull(continuationReq);
 
         if (continuationResponse.trim().length === 0) {
             log.warn('Handler', 'continuation', '非流式续写返回空响应，停止续写');
@@ -1845,6 +1988,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         log.warn('Handler', 'truncation', `非流式检测到截断响应 (${fullText.length} chars) → stop_reason=max_tokens`);
     }
 
+    let toolCallsDetected = 0;
     if (hasTools) {
         let { toolCalls, cleanText } = parseToolCalls(fullText);
 
@@ -1899,12 +2043,14 @@ Please go ahead and pick the most appropriate tool for the current task and outp
                 },
             ];
             activeCursorReq = { ...activeCursorReq, messages: forceMessages };
-            fullText = await sendCursorRequestFull(activeCursorReq);
+            ({ text: fullText } = await sendCursorRequestFull(activeCursorReq));
             ({ toolCalls, cleanText } = parseToolCalls(fullText));
         }
         if (toolChoice?.type === 'any' && toolCalls.length === 0) {
             log.warn('Handler', 'toolparse', `非流式 tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
         }
+
+        toolCallsDetected = toolCalls.length;
 
         if (toolCalls.length > 0) {
             stopReason = 'tool_use';
@@ -1963,6 +2109,14 @@ Please go ahead and pick the most appropriate tool for the current task and outp
 
     // ★ 记录完成
     log.recordFinalResponse(fullText);
+    const estimatedInput = estimateCursorReqTokens(activeCursorReq);
+    const actualInput = cursorUsage?.inputTokens;
+    console.log(`[TokenDiff] 非流式 估算(我们发的)=${estimatedInput} Cursor实际=${actualInput ?? 'N/A'} Cursor隐藏开销=${actualInput != null ? (actualInput - estimatedInput) : 'N/A'}`);
+    log.updateSummary({
+        inputTokens: cursorUsage?.inputTokens,
+        outputTokens: cursorUsage?.outputTokens,
+        toolCallsDetected,
+    });
     log.complete(fullText.length, stopReason);
 
     } catch (err: unknown) {

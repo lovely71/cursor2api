@@ -47,14 +47,22 @@
         <div class="conv-grid">
           <div class="cg-item"><span class="cg-l">原始工具数</span><span class="cg-v">{{ convSummary.origToolCount }}</span></div>
           <div class="cg-item"><span class="cg-l">Cursor工具数</span><span class="cg-v" style="color:var(--green)">0 <small>(嵌入消息)</small></span></div>
-          <div class="cg-item"><span class="cg-l">工具指令占用</span><span class="cg-v">{{ convSummary.toolInstrChars > 0 ? fmtN(convSummary.toolInstrChars) + ' chars' : convSummary.origToolCount > 0 ? '嵌入#1' : 'N/A' }}</span></div>
+          <div class="cg-item"><span class="cg-l">总上下文</span><span class="cg-v">{{ convSummary.totalChars ? fmtN(convSummary.totalChars) + ' chars' : '—' }}</span></div>
+          <div class="cg-item"><span class="cg-l">↑ Cursor 输入 tokens</span><span class="cg-v" style="color:var(--blue)">{{ curReq?.inputTokens ? fmtN(curReq.inputTokens) : '—' }}</span></div>
           <div class="cg-item"><span class="cg-l">原始消息数</span><span class="cg-v">{{ convSummary.origMsgCount }}</span></div>
           <div class="cg-item"><span class="cg-l">Cursor消息数</span><span class="cg-v" style="color:var(--green)">{{ convSummary.cursorMsgCount }}</span></div>
-          <div class="cg-item"><span class="cg-l">总上下文</span><span class="cg-v">{{ convSummary.totalChars ? fmtN(convSummary.totalChars) + ' chars' : '—' }}</span></div>
+          <div class="cg-item"><span class="cg-l">工具指令占用</span><span class="cg-v">{{ convSummary.toolInstrChars > 0 ? fmtN(convSummary.toolInstrChars) + ' chars' : convSummary.origToolCount > 0 ? '嵌入#1' : 'N/A' }}</span></div>
+          <div class="cg-item"><span class="cg-l">↓ Cursor 输出 tokens</span><span class="cg-v" style="color:var(--green)">{{ curReq?.outputTokens ? fmtN(curReq.outputTokens) : '—' }}</span></div>
         </div>
         <div v-if="convSummary.origToolCount > 0" class="tool-warn">
           ⚠️ Cursor API 不支持原生 tools。{{ convSummary.origToolCount }} 个工具已转为文本指令嵌入 user#1{{ convSummary.toolInstrChars > 0 ? '（约 ' + fmtN(convSummary.toolInstrChars) + ' chars）' : '' }}
         </div>
+      </Section>
+
+      <Section v-if="logsStore.payload.question"
+        :title="`❓ 用户问题摘要`" :count="logsStore.payload.question.length" count-unit="chars"
+        border-color="var(--orange)">
+        <CodeBlock :content="logsStore.payload.question" :mdPreview="mdPreview" />
       </Section>
 
       <Section v-if="logsStore.payload.systemPrompt"
@@ -99,6 +107,17 @@
 
     <!-- 响应内容 tab -->
     <template v-else-if="mode === 'response'">
+      <Section v-if="logsStore.payload.answer"
+        :title="logsStore.payload.answerType === 'tool_calls' ? '✅ 最终结果（工具调用摘要）' : '✅ 最终回答摘要'"
+        :count="logsStore.payload.answer.length" count-unit="chars">
+        <CodeBlock :content="logsStore.payload.answer" :mdPreview="mdPreview" lang="markdown" />
+      </Section>
+
+      <Section v-if="logsStore.payload.toolCallNames?.length && !logsStore.payload.toolCalls"
+        :title="`🔧 工具调用名称`" :count="logsStore.payload.toolCallNames.length" count-unit="个">
+        <CodeBlock :content="logsStore.payload.toolCallNames.join(', ')" />
+      </Section>
+
       <Section v-if="logsStore.payload.thinkingContent"
         :title="`🧠 Thinking`" :count="logsStore.payload.thinkingContent.length" count-unit="chars">
         <CodeBlock :content="logsStore.payload.thinkingContent" :mdPreview="mdPreview" />
@@ -116,7 +135,7 @@
 
       <Section v-if="logsStore.payload.toolCalls?.length"
         :title="`🔧 工具调用`" :count="logsStore.payload.toolCalls.length" count-unit="个">
-        <CodeBlock :content="fmt(logsStore.payload.toolCalls)" />
+        <CodeBlock lang="json" :content="fmt(logsStore.payload.toolCalls)" />
       </Section>
 
       <Section v-if="logsStore.payload.retryResponses?.length"
@@ -237,15 +256,17 @@ function msgDefaultOpen(
 }
 
 const hasRequest = computed(() =>
-  !!(logsStore.payload?.tools?.length || logsStore.payload?.cursorRequest || logsStore.payload?.cursorMessages?.length)
+  !!(curReq.value || logsStore.payload?.tools?.length || logsStore.payload?.cursorRequest || logsStore.payload?.cursorMessages?.length)
 );
 const hasPrompts = computed(() =>
-  !!(logsStore.payload?.systemPrompt || logsStore.payload?.messages?.length)
+  !!(convSummary.value || logsStore.payload?.question || logsStore.payload?.systemPrompt ||
+     logsStore.payload?.messages?.length || logsStore.payload?.cursorMessages?.length)
 );
 const hasResponse = computed(() =>
-  !!(logsStore.payload?.finalResponse || logsStore.payload?.thinkingContent ||
-     logsStore.payload?.toolCalls?.length || logsStore.payload?.retryResponses?.length ||
-     logsStore.payload?.continuationResponses?.length)
+  !!(logsStore.payload?.answer || logsStore.payload?.toolCallNames?.length ||
+     logsStore.payload?.thinkingContent || logsStore.payload?.finalResponse ||
+     logsStore.payload?.rawResponse || logsStore.payload?.toolCalls?.length ||
+     logsStore.payload?.retryResponses?.length || logsStore.payload?.continuationResponses?.length)
 );
 
 // ===== 消息搜索 =====
@@ -280,10 +301,11 @@ const Section = defineComponent({
     title: String,
     count: Number,
     countUnit: { type: String, default: '' },
+    borderColor: { type: String, default: '' },
   },
   setup(p, { slots }) {
     const open = ref(true);
-    return () => h('div', { class: 'cs' }, [
+    return () => h('div', { class: 'cs', style: p.borderColor ? { borderLeft: '3px solid ' + p.borderColor, paddingLeft: '0' } : {} }, [
       h('div', {
         class: 'cs-hdr',
         onClick: () => { open.value = !open.value; },
@@ -333,12 +355,9 @@ const CodeBlock = defineComponent({
       const lang = p.lang || '';
       let highlighted = '';
       try {
-        if (lang && hljs.getLanguage(lang)) {
+        // markdown 类型只在 mdPreview 模式下渲染，非 mdPreview 时显示原始文本
+        if (lang && lang !== 'markdown' && hljs.getLanguage(lang)) {
           highlighted = hljs.highlight(content, { language: lang }).value;
-        } else {
-          // 自动检测，优先尝试 JSON
-          const auto = hljs.highlightAuto(content, ['json', 'javascript', 'typescript', 'python', 'bash', 'yaml']);
-          highlighted = auto.value;
         }
       } catch { highlighted = ''; }
       if (highlighted) {
@@ -621,7 +640,7 @@ mark.hl {
 
 /* 转换摘要 */
 .conv-grid {
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 8px;
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 8px;
 }
 .cg-item {
   display: flex; flex-direction: column; gap: 2px;

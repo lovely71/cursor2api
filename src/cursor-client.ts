@@ -136,6 +136,12 @@ async function sendCursorRequestInner(
         const REPEAT_THRESHOLD = 8;       // 同一 delta 连续出现 8 次 → 退化
         let degenerateAborted = false;
 
+        // ★ HTML token 重复检测：历史消息较多时模型偶发连续输出 <br>、</s> 等 HTML token 的 bug
+        // 用 tagBuffer 跨 delta 拼接，提取完整 token 后检测连续重复，不依赖换行
+        let tagBuffer = '';
+        let htmlRepeatAborted = false;
+        const HTML_TOKEN_RE = /(<\/?[a-z][a-z0-9]*\s*\/?>|&[a-z]+;)/gi;
+
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -165,7 +171,6 @@ async function sendCursorRequestInner(
                                 if (repeatCount >= REPEAT_THRESHOLD) {
                                     console.warn(`[Cursor] ⚠️ 检测到退化循环: "${trimmedDelta}" 已连续重复 ${repeatCount} 次，中止流`);
                                     degenerateAborted = true;
-                                    // 不再转发此 delta，直接中止
                                     reader.cancel();
                                     break;
                                 }
@@ -178,6 +183,34 @@ async function sendCursorRequestInner(
                             lastDelta = '';
                             repeatCount = 0;
                         }
+
+                        // ★ HTML token 重复检测：跨 delta 拼接，提取完整 HTML token 后检测连续重复
+                        // 解决 <br>、</s>、&nbsp; 等被拆散发送或无换行导致退化检测失效的 bug
+                        tagBuffer += event.delta;
+                        const tagMatches = [...tagBuffer.matchAll(new RegExp(HTML_TOKEN_RE.source, 'gi'))];
+                        if (tagMatches.length > 0) {
+                            const lastTagMatch = tagMatches[tagMatches.length - 1];
+                            tagBuffer = tagBuffer.slice(lastTagMatch.index! + lastTagMatch[0].length);
+                            for (const m of tagMatches) {
+                                const token = m[0].toLowerCase();
+                                if (token === lastDelta) {
+                                    repeatCount++;
+                                    if (repeatCount >= REPEAT_THRESHOLD) {
+                                        console.warn(`[Cursor] ⚠️ 检测到 HTML token 重复: "${token}" 已连续重复 ${repeatCount} 次，中止流`);
+                                        htmlRepeatAborted = true;
+                                        reader.cancel();
+                                        break;
+                                    }
+                                } else {
+                                    lastDelta = token;
+                                    repeatCount = 1;
+                                }
+                            }
+                            if (htmlRepeatAborted) break;
+                        } else if (tagBuffer.length > 20) {
+                            // 超过 20 字符还没有完整 HTML token，不是 HTML 序列，清空避免内存累积
+                            tagBuffer = '';
+                        }
                     }
 
                     onChunk(event);
@@ -186,12 +219,16 @@ async function sendCursorRequestInner(
                 }
             }
 
-            if (degenerateAborted) break;
+            if (degenerateAborted || htmlRepeatAborted) break;
         }
 
         // ★ 退化循环中止后，抛出特殊错误让外层 sendCursorRequest 不再重试
         if (degenerateAborted) {
             throw new Error('DEGENERATE_LOOP_ABORTED');
+        }
+        // ★ HTML token 重复中止后，抛出普通错误让外层 sendCursorRequest 走正常重试
+        if (htmlRepeatAborted) {
+            throw new Error('HTML_REPEAT_ABORTED');
         }
 
         // 处理剩余 buffer
@@ -210,14 +247,18 @@ async function sendCursorRequestInner(
 }
 
 /**
- * 发送非流式请求，收集完整响应
+ * 发送非流式请求，收集完整响应及 usage 信息
  */
-export async function sendCursorRequestFull(req: CursorChatRequest): Promise<string> {
+export async function sendCursorRequestFull(req: CursorChatRequest): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number } }> {
     let fullText = '';
+    let usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined;
     await sendCursorRequest(req, (event) => {
         if (event.type === 'text-delta' && event.delta) {
             fullText += event.delta;
         }
+        if (event.messageMetadata?.usage) {
+            usage = event.messageMetadata.usage;
+        }
     });
-    return fullText;
+    return { text: fullText, usage };
 }

@@ -34,6 +34,8 @@ const THINKING_CLOSE = '</thinking>';
 const DEFAULT_WARMUP_CHARS = 96;
 const DEFAULT_GUARD_CHARS = 256;
 const STREAM_START_BOUNDARY_RE = /[\n。！？.!?]/;
+const HTML_TOKEN_STRIP_RE = /(<\/?[a-z][a-z0-9]*\s*\/?>|&[a-z]+;)/gi;
+const HTML_VALID_RATIO_MIN = 0.2;   // 去掉 HTML token 后有效字符占比低于此值则继续缓冲
 
 /**
  * 剥离完整的 thinking 标签，返回可用于拒绝检测或最终文本处理的正文。
@@ -96,10 +98,14 @@ export function splitLeadingThinkingBlocks(text: string): LeadingThinkingSplit {
     while (cursor.startsWith(THINKING_OPEN)) {
         const closeIndex = cursor.indexOf(THINKING_CLOSE, THINKING_OPEN.length);
         if (closeIndex === -1) {
+            // ★ 未闭合（截断）：返回截断前已积累的部分 thinking 内容
+            // 当前未闭合块的内容 + 前面已完整的块（如有多个连续 thinking 块的情况）
+            const partialContent = cursor.slice(THINKING_OPEN.length).trim();
+            const allParts = [...thinkingParts, ...(partialContent ? [partialContent] : [])];
             return {
                 startedWithThinking: true,
                 complete: false,
-                thinkingContent: '',
+                thinkingContent: allParts.join('\n\n'),
                 remainder: '',
             };
         }
@@ -152,6 +158,17 @@ export function createIncrementalTextStreamer(
 
         if (isBlockedPrefix(preview.trim())) {
             return false;
+        }
+
+        // ★ HTML 内容有效性检查：防止 <br>、</s>、&nbsp; 等纯 HTML token 连续重复时提前 unlock
+        // 超过 guardChars（256）后强制放行，此时 cursor-client 的 htmlRepeatAborted 早已触发重试
+        if (preview.length < guardChars) {
+            const noSpace = preview.replace(/\s/g, '');
+            const stripped = noSpace.replace(HTML_TOKEN_STRIP_RE, '');
+            const ratio = noSpace.length === 0 ? 0 : stripped.length / noSpace.length;
+            if (ratio < HTML_VALID_RATIO_MIN) {
+                return false;
+            }
         }
 
         unlocked = true;

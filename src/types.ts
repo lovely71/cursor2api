@@ -91,6 +91,14 @@ export interface CursorPart {
 export interface CursorSSEEvent {
     type: string;
     delta?: string;
+    finishReason?: string;
+    messageMetadata?: {
+        usage?: {
+            inputTokens?: number;
+            outputTokens?: number;
+            totalTokens?: number;
+        };
+    };
 }
 
 // ==================== Internal Types ====================
@@ -107,7 +115,8 @@ export interface AppConfig {
     cursorModel: string;
     authTokens?: string[];  // API 鉴权 token 列表，为空则不鉴权
     maxAutoContinue: number;        // 自动续写最大次数，默认 3，设 0 禁用
-    maxHistoryMessages: number;     // 历史消息条数硬限制，默认 100，-1 不限制
+    maxHistoryMessages: number;     // 历史消息条数硬限制，默认 -1（不限制）
+    maxHistoryTokens: number;       // 历史消息 token 数上限（tiktoken 估算我们发出的内容，代码自动加 Cursor 后端开销：1300 基础 + perTool*工具数），默认 150000，-1 不限制
     vision?: {
         enabled: boolean;
         mode: 'ocr' | 'api';
@@ -129,6 +138,9 @@ export interface AppConfig {
         file_enabled: boolean;     // 是否启用日志文件持久化
         dir: string;               // 日志文件存储目录
         max_days: number;          // 日志保留天数
+        persist_mode: 'compact' | 'full' | 'summary'; // 落盘模式: compact=精简, full=完整, summary=仅问答摘要
+        db_enabled: boolean;       // 是否启用 SQLite 存储
+        db_path: string;           // SQLite 文件路径，默认 './logs/cursor2api.db'
     };
     tools?: {
         schemaMode: 'compact' | 'full' | 'names_only';  // Schema 呈现模式

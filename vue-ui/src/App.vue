@@ -3,11 +3,12 @@
     <template v-if="authChecked">
       <LoginPage v-if="!isLoggedIn" @loggedIn="onLogin" />
       <template v-else>
-        <AppHeader :connected="sseConnected" />
+        <AppHeader :connected="sseConnected" @openConfig="configDrawerVisible = true" />
         <div class="main">
           <RequestList />
           <DetailPanel />
         </div>
+        <ConfigDrawer :visible="configDrawerVisible" @close="configDrawerVisible = false" />
       </template>
     </template>
   </div>
@@ -24,6 +25,7 @@ import LoginPage from './components/LoginPage.vue';
 import AppHeader from './components/AppHeader.vue';
 import RequestList from './components/RequestList.vue';
 import DetailPanel from './components/DetailPanel.vue';
+import ConfigDrawer from './components/ConfigDrawer.vue';
 
 const auth = useAuthStore();
 const logsStore = useLogsStore();
@@ -32,6 +34,7 @@ const { loggedIn: isLoggedIn } = storeToRefs(auth);
 
 const authChecked = ref(false);
 const sseConnected = ref(false);
+const configDrawerVisible = ref(false);
 
 // 初始化主题（避免闪烁）
 const savedTheme = localStorage.getItem('cursor2api_theme') ?? 'light';
@@ -48,7 +51,7 @@ onMounted(async () => {
     history.replaceState(null, '', location.pathname);
   }
   try {
-    const res = await fetch('/api/stats', {
+    const res = await fetch('/api/vue/stats', {
       headers: auth.token ? { Authorization: `Bearer ${auth.token}` } : {},
     });
     if (res.ok) {

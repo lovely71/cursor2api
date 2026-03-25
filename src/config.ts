@@ -37,6 +37,7 @@ function parseYamlConfig(defaults: AppConfig): { config: AppConfig; raw: Record<
         if (yaml.cursor_model) result.cursorModel = yaml.cursor_model;
         if (typeof yaml.max_auto_continue === 'number') result.maxAutoContinue = yaml.max_auto_continue;
         if (typeof yaml.max_history_messages === 'number') result.maxHistoryMessages = yaml.max_history_messages;
+        if (typeof yaml.max_history_tokens === 'number') result.maxHistoryTokens = yaml.max_history_tokens;
         if (yaml.fingerprint) {
             if (yaml.fingerprint.user_agent) result.fingerprint.userAgent = yaml.fingerprint.user_agent;
         }
@@ -74,10 +75,14 @@ function parseYamlConfig(defaults: AppConfig): { config: AppConfig; raw: Record<
         }
         // ★ 日志文件持久化
         if (yaml.logging !== undefined) {
+            const persistModes = ['compact', 'full', 'summary'];
             result.logging = {
                 file_enabled: yaml.logging.file_enabled === true, // 默认关闭
                 dir: yaml.logging.dir || './logs',
                 max_days: typeof yaml.logging.max_days === 'number' ? yaml.logging.max_days : 7,
+                persist_mode: persistModes.includes(yaml.logging.persist_mode) ? yaml.logging.persist_mode : 'summary',
+                db_enabled: yaml.logging.db_enabled === true,
+                db_path: yaml.logging.db_path || './logs/cursor2api.db',
             };
         }
         // ★ 工具处理配置
@@ -118,6 +123,7 @@ function applyEnvOverrides(cfg: AppConfig): void {
     if (process.env.CURSOR_MODEL) cfg.cursorModel = process.env.CURSOR_MODEL;
     if (process.env.MAX_AUTO_CONTINUE !== undefined) cfg.maxAutoContinue = parseInt(process.env.MAX_AUTO_CONTINUE);
     if (process.env.MAX_HISTORY_MESSAGES !== undefined) cfg.maxHistoryMessages = parseInt(process.env.MAX_HISTORY_MESSAGES);
+    if (process.env.MAX_HISTORY_TOKENS !== undefined) cfg.maxHistoryTokens = parseInt(process.env.MAX_HISTORY_TOKENS);
     if (process.env.AUTH_TOKEN) {
         cfg.authTokens = process.env.AUTH_TOKEN.split(',').map(s => s.trim()).filter(Boolean);
     }
@@ -139,12 +145,28 @@ function applyEnvOverrides(cfg: AppConfig): void {
     }
     // Logging 环境变量覆盖
     if (process.env.LOG_FILE_ENABLED !== undefined) {
-        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7 };
+        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary', db_enabled: false, db_path: './logs/cursor2api.db' };
         cfg.logging.file_enabled = process.env.LOG_FILE_ENABLED === 'true' || process.env.LOG_FILE_ENABLED === '1';
     }
     if (process.env.LOG_DIR) {
-        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7 };
+        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary', db_enabled: false, db_path: './logs/cursor2api.db' };
         cfg.logging.dir = process.env.LOG_DIR;
+    }
+    if (process.env.LOG_PERSIST_MODE) {
+        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary', db_enabled: false, db_path: './logs/cursor2api.db' };
+        cfg.logging.persist_mode = process.env.LOG_PERSIST_MODE === 'full'
+            ? 'full'
+            : process.env.LOG_PERSIST_MODE === 'summary'
+                ? 'summary'
+                : 'compact';
+    }
+    if (process.env.LOG_DB_ENABLED !== undefined) {
+        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary', db_enabled: false, db_path: './logs/cursor2api.db' };
+        cfg.logging.db_enabled = process.env.LOG_DB_ENABLED === 'true' || process.env.LOG_DB_ENABLED === '1';
+    }
+    if (process.env.LOG_DB_PATH) {
+        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary', db_enabled: false, db_path: './logs/cursor2api.db' };
+        cfg.logging.db_path = process.env.LOG_DB_PATH;
     }
     // 工具透传模式环境变量覆盖
     if (process.env.TOOLS_PASSTHROUGH !== undefined) {
@@ -183,6 +205,7 @@ function defaultConfig(): AppConfig {
         cursorModel: 'anthropic/claude-sonnet-4.6',
         maxAutoContinue: 0,
         maxHistoryMessages: -1,
+        maxHistoryTokens: 150000,
         sanitizeEnabled: false,  // 默认关闭响应内容清洗
         fingerprint: {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
@@ -202,6 +225,7 @@ function detectChanges(oldCfg: AppConfig, newCfg: AppConfig): string[] {
     if (oldCfg.cursorModel !== newCfg.cursorModel) changes.push(`cursor_model: ${oldCfg.cursorModel} → ${newCfg.cursorModel}`);
     if (oldCfg.maxAutoContinue !== newCfg.maxAutoContinue) changes.push(`max_auto_continue: ${oldCfg.maxAutoContinue} → ${newCfg.maxAutoContinue}`);
     if (oldCfg.maxHistoryMessages !== newCfg.maxHistoryMessages) changes.push(`max_history_messages: ${oldCfg.maxHistoryMessages} → ${newCfg.maxHistoryMessages}`);
+    if (oldCfg.maxHistoryTokens !== newCfg.maxHistoryTokens) changes.push(`max_history_tokens: ${oldCfg.maxHistoryTokens} → ${newCfg.maxHistoryTokens}`);
 
     // auth_tokens
     const oldTokens = (oldCfg.authTokens || []).join(',');
