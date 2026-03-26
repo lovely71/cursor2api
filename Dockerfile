@@ -1,23 +1,33 @@
-# ==== Stage 1: 构建阶段 (Builder) ====
-FROM node:22-alpine AS builder
+# ==== Base ====
+# Alpine + QEMU/buildx 在 npm 安装原生模块时更容易触发非法指令/总线错误，
+# 改用 Debian slim 并在构建阶段完成原生依赖编译，运行阶段直接复用产物。
+FROM node:22-bookworm-slim AS base
 
-# 设置工作目录
 WORKDIR /app
 
-# 仅拷贝包配置并安装所有依赖项（利用 Docker 缓存层）
+# ==== Stage 1: 构建阶段 (Builder) ====
+FROM base AS builder
+
+# better-sqlite3 在部分架构下需要本地编译，保留最小构建工具链。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# 先安装依赖，最大化利用 Docker 缓存。
 COPY package.json package-lock.json ./
-# 跨架构 buildx/QEMU 下安装脚本偶发触发非法指令；本项目构建不依赖这些脚本
-RUN npm ci --ignore-scripts
+RUN npm ci
 
 # 拷贝项目源代码并执行 TypeScript 编译
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
-# ==== Stage 2: 生产运行阶段 (Runner) ====
-FROM node:22-alpine AS runner
+# 编译完成后裁剪 devDependencies，缩小运行镜像体积。
+RUN npm prune --omit=dev \
+    && npm cache clean --force
 
-WORKDIR /app
+# ==== Stage 2: 生产运行阶段 (Runner) ====
+FROM base AS runner
 
 # 设置为生产环境
 ENV NODE_ENV=production
@@ -26,15 +36,12 @@ ENV NODE_ENV=production
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 
 # 出于安全考虑，避免使用 root 用户运行服务
-RUN addgroup --system --gid 1001 nodejs && \
-    adduser --system --uid 1001 cursor
+RUN groupadd --system --gid 1001 nodejs \
+    && useradd --system --uid 1001 --gid 1001 cursor
 
-# 拷贝包配置并仅安装生产环境依赖（极大减小镜像体积）
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts \
-    && npm cache clean --force
-
-# 从 builder 阶段拷贝编译后的产物
+# 复用 builder 阶段已经编译并裁剪过的依赖，避免在运行阶段再次执行 npm ci。
+COPY --from=builder /app/package.json /app/package-lock.json ./
+COPY --from=builder --chown=cursor:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=cursor:nodejs /app/dist ./dist
 
 # 拷贝前端静态资源（日志查看器 Web UI）
